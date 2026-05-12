@@ -29,6 +29,28 @@ SCENARIOS = {
     "Regulatory Shock":             {"shocks":{"BTC":-0.20,"ETH":-0.25,"SOL":-0.40,"BNB":-0.45,"XRP":-0.50},"adv_mult":0.60,"lambda_mult":1.8,"vol_mult":2.2,"description":"Major-jurisdiction enforcement action."},
 }
 
+# ── Risk regime classification (based on last 1-day portfolio return) ──────
+# Extreme loss  < -5%   → Crisis
+# Severe loss   < -3%   → High Risk
+# Moderate loss < -1.5% → Elevated
+# Small loss    < 0%    → Moderate  (normal fluctuation, no alarm)
+# Small gain    < +1.5% → Stable
+# Strong gain   >= +1.5%→ Bull
+REGIME_RULES = [
+    (-0.05, "Crisis",   "#7b241c"),
+    (-0.03, "High Risk","#c0392b"),
+    (-0.015,"Elevated", "#e67e22"),
+    ( 0.00, "Moderate", "#f0c040"),
+    ( 0.015,"Stable",   "#27ae60"),
+]
+REGIME_BULL = ("Bull", "#1a5276")
+
+def classify_regime(ret):
+    if pd.isna(ret): return "N/A", "#999"
+    for threshold, label, color in REGIME_RULES:
+        if ret < threshold: return label, color
+    return REGIME_BULL
+
 def _fetch_one(symbol, start, end, attempts=3, sleep=1.5):
     for k in range(attempts):
         try:
@@ -143,6 +165,18 @@ def pctf(x, d=2):
     if x is None or (isinstance(x, float) and np.isnan(x)): return "—"
     return f"{x*100:.{d}f}%"
 
+# ── Liq. days → human-readable (seconds / minutes / hours / days) ──────────
+def fmt_liq_time(position_usd, adv_usd):
+    if adv_usd <= 0 or np.isnan(adv_usd): return "∞"
+    days = position_usd / (adv_usd * LIQ_PARTICIPATION)
+    secs = days * 86400
+    if secs < 60:   return f"{secs:.0f}s"
+    mins = secs / 60
+    if mins < 60:   return f"{mins:.1f}min"
+    hrs  = mins / 60
+    if hrs  < 24:   return f"{hrs:.2f}h"
+    return f"{days:.3f}d"
+
 END   = pd.Timestamp.today().normalize()
 START = END - pd.Timedelta(days=365*3)
 print(f"Loading {START.date()} → {END.date()} …")
@@ -245,12 +279,23 @@ def render_market(holdings, alpha):
     avg_p  = df.pivot_table(index="date",columns="asset",values="close").mean(axis=1).dropna()
     mdd    = max_drawdown(avg_p)
     last_r = port_ret.iloc[-1] if not port_ret.empty else np.nan
-    risk   = ("High" if not pd.isna(last_r) and last_r<-0.03
-              else "Medium" if not pd.isna(last_r) and last_r<-0.015
-              else "Moderate" if not pd.isna(last_r) else "N/A")
+    risk, rc = classify_regime(last_r)
     senti  = ("Risk-off" if not pd.isna(ret_7d) and ret_7d<-0.10
               else "Risk-on" if not pd.isna(ret_7d) and ret_7d>0.10
               else "Neutral" if not pd.isna(ret_7d) else "N/A")
+    sc = {"Risk-on":"#27ae60","Risk-off":"#c0392b"}.get(senti,"#999")
+
+    # Regime legend
+    regime_legend = dbc.Alert([
+        html.Strong("Risk Regime scale (based on last 1-day portfolio return): "),
+        html.Span("Crisis ", style={"color":"#7b241c","fontWeight":700}), html.Span("< −5%  │  "),
+        html.Span("High Risk ", style={"color":"#c0392b","fontWeight":700}), html.Span("< −3%  │  "),
+        html.Span("Elevated ", style={"color":"#e67e22","fontWeight":700}), html.Span("< −1.5%  │  "),
+        html.Span("Moderate ", style={"color":"#f0c040","fontWeight":700}), html.Span("−1.5% to 0%  │  "),
+        html.Span("Stable ", style={"color":"#27ae60","fontWeight":700}), html.Span("0% to +1.5%  │  "),
+        html.Span("Bull ", style={"color":"#1a5276","fontWeight":700}), html.Span("> +1.5%"),
+    ], color="light", style={"fontSize":"0.78rem","padding":"6px 12px","marginBottom":"8px"})
+
     fig_norm = px.line(df, x="date", y="norm_price", color="asset",
                        title="Normalised price (start=1.0)", height=320)
     fig_norm.update_layout(template="plotly_white", legend_title="")
@@ -267,9 +312,8 @@ def render_market(holdings, alpha):
         text=corr.values, texttemplate="%{text:.2f}"))
     fig_corr.update_layout(title="Return correlation matrix",
                            template="plotly_white", height=320)
-    rc = {"High":"#c0392b","Medium":"#e67e22","Moderate":"#27ae60"}.get(risk,"#999")
-    sc = {"Risk-on":"#27ae60","Risk-off":"#c0392b"}.get(senti,"#999")
     return html.Div([
+        regime_legend,
         dbc.Row([
             dbc.Col(kpi_card("Risk regime",   risk,           "1-day signal", rc)),
             dbc.Col(kpi_card("Vol (30d)",      pctf(vol_30,1),"Annualised (√365)")),
@@ -402,12 +446,10 @@ def render_liq(holdings, alpha, lam):
         var_a = hist_var(df[df["asset"]==a]["return"], alpha)
         lc = liquidity_cost(h, adv, sd, lam); total_lc += lc
         lavar = (var_a*h+lc) if not np.isnan(var_a) else np.nan
-        liq_days = (h/(adv*LIQ_PARTICIPATION)) if adv>0 else float("inf")
-        ld_str = ("∞" if (np.isnan(liq_days) or not np.isfinite(liq_days))
-                  else (f"{liq_days*24:.1f}h" if liq_days<1 else f"{liq_days:.3f}d"))
+        ld_str = fmt_liq_time(h, adv)   # ← FIX: human-readable
         rows.append({"Asset":a, "Position":money(h), "30-day ADV":money(adv),
                      "Position/ADV": f"{(h/adv*100 if adv>0 else 0):.4f}%",
-                     "Liq. days":ld_str, "σ (daily)":f"{sd*100:.2f}%",
+                     "Liq. time":ld_str, "σ (daily)":f"{sd*100:.2f}%",
                      "Liq. cost":money(lc),
                      "Std VaR ($)":money(var_a*h) if not np.isnan(var_a) else "—",
                      "L-VaR ($)":money(lavar) if not np.isnan(lavar) else "—"})
@@ -434,12 +476,16 @@ def render_liq(holdings, alpha, lam):
                           annotation_text=f"Std VaR={money(std_var_usd)}")
     fig_lam.add_vline(x=lam, line_color="black", line_dash="dot",
                       annotation_text=f"λ={lam:.2f}")
-    fig_lam.update_layout(title="L-VaR vs λ (BDSS sensitivity)",
+    fig_lam.update_layout(title="L-VaR vs λ (price-impact sensitivity)",
                           template="plotly_white", height=380,
                           xaxis_title="λ", yaxis_title="USD")
     return html.Div([
-        info_alert([("BDSS","LC = λ · (Position/ADV) · σ · Position;  L-VaR = Std VaR + LC"),
-                    ("ADV","Yahoo Finance crypto Volume already in USD")]),
+        info_alert([
+            ("Liquidity Cost", "LC = λ · (Position/ADV) · σ · Position  "
+             "[Kyle/Almgren-Chriss adapted; λ = price-impact coeff.; ADV = 30d avg. daily volume]"),
+            ("L-VaR", "L-VaR = Std VaR + LC"),
+            ("Liq. time", "Time to liquidate at 25% daily volume participation"),
+        ]),
         section_card(f"Per-asset liquidity (λ={lam:.2f}, α={int(alpha*100)}%)", [
             dash_table.DataTable(
                 columns=[{"name":c,"id":c} for c in rows[0].keys()] if rows else [],
@@ -535,26 +581,46 @@ def render_scen(holdings, alpha, lam, scenario):
 def render_methodology():
     return html.Div([
         section_card("Risk methodology", [
-            html.P("Three VaR estimators (Historical, Parametric, Cornish-Fisher), "
-                   "Expected Shortfall, Bootstrap CI (n=1,000), "
-                   "Kupiec POF backtest, Component VaR (Euler), BDSS L-VaR, "
-                   "4 stress scenarios."),
+            html.P("Three VaR estimators (Historical Simulation, Parametric Normal, Cornish-Fisher), "
+                   "Expected Shortfall (CVaR), Bootstrap CI (n=1,000), "
+                   "Kupiec POF backtest, Component VaR (Euler allocation), "
+                   "Liquidity-adjusted VaR (L-VaR), 4 stress scenarios."),
             html.P([html.B("Annualisation: "),
-                    "σ_annual = σ_daily × √365 (crypto markets trade 365 days/year, 24/7)"]),
-            html.P([html.B("Cornish-Fisher: "),
-                    "z* = z + (z²−1)·s/6 + (z³−3z)·k/24 − (2z³−5z)·s²/36"]),
-            html.P([html.B("BDSS L-VaR: "),
-                    "LC = λ·(Position/ADV)·σ·Position;  L-VaR = Std VaR + LC"]),
+                    "σ_annual = σ_daily × √365  (crypto markets trade 24/7, 365 days/year; "
+                    "cf. √252 for equities)"]),
+            html.P([html.B("Cornish-Fisher VaR: "),
+                    "z* = z + (z²−1)·γ₁/6 + (z³−3z)·γ₂/24 − (2z³−5z)·γ₁²/36  "
+                    "where γ₁ = skewness, γ₂ = excess kurtosis, z = Φ⁻¹(α)"]),
+            html.P([html.B("Liquidity Cost (Kyle 1985 / Almgren-Chriss 2000, simplified): "),
+                    "LC = λ · (Position / ADV) · σ · Position  "
+                    "= λ · σ · Position² / ADV  "
+                    "[quadratic in position size; λ = price-impact coefficient; "
+                    "ADV = 30-day average daily volume in USD]"]),
+            html.P([html.B("L-VaR (Liquidity-adjusted VaR): "),
+                    "L-VaR = Std VaR + LC"]),
+            html.P([html.B("Risk Regime classification (1-day portfolio return r): "),
+                    "Crisis r < −5% │ High Risk r < −3% │ Elevated r < −1.5% │ "
+                    "Moderate −1.5% ≤ r < 0% │ Stable 0% ≤ r < +1.5% │ Bull r ≥ +1.5%"]),
         ], icon="🔬"),
         section_card("References", [html.Ol([
-            html.Li("Bangia, Diebold, Schuermann & Stroughair (1999). Modeling liquidity risk."),
-            html.Li("Almgren & Chriss (2000). Optimal execution. J. of Risk, 3(2)."),
-            html.Li("Kupiec (1995). Techniques for verifying VaR models. J. of Derivatives."),
-            html.Li("Artzner et al. (1999). Coherent measures of risk. Math. Finance."),
-            html.Li("Cornish & Fisher (1937). Moments and cumulants."),
-            html.Li("Kyle (1985). Continuous auctions. Econometrica, 53(6)."),
-            html.Li("Brunnermeier & Pedersen (2009). Market liquidity. RFS, 22(6)."),
-            html.Li("BCBS (2019). Minimum capital requirements for market risk (d457)."),
+            html.Li("Bangia, Diebold, Schuermann & Stroughair (1999). "
+                    "Modeling Liquidity Risk, with Implications for Traditional Market Risk "
+                    "Measurement and Management. Wharton FIC Working Paper 99-06."),
+            html.Li("Almgren, R. & Chriss, N. (2000). Optimal execution of portfolio "
+                    "transactions. Journal of Risk, 3(2), 5–39."),
+            html.Li("Kyle, A. S. (1985). Continuous auctions and insider trading. "
+                    "Econometrica, 53(6), 1315–1335."),
+            html.Li("Kupiec, P. H. (1995). Techniques for verifying the accuracy of "
+                    "risk measurement models. Journal of Derivatives, 3(2), 73–84."),
+            html.Li("Artzner, P., Delbaen, F., Eber, J.-M. & Heath, D. (1999). "
+                    "Coherent measures of risk. Mathematical Finance, 9(3), 203–228."),
+            html.Li("Cornish, E. A. & Fisher, R. A. (1937). Moments and cumulants in "
+                    "the specification of distributions. Revue de l'Institut International "
+                    "de Statistique, 5(4), 307–320."),
+            html.Li("Brunnermeier, M. K. & Pedersen, L. H. (2009). Market liquidity and "
+                    "funding liquidity. Review of Financial Studies, 22(6), 2201–2238."),
+            html.Li("Basel Committee on Banking Supervision (2019). Minimum capital "
+                    "requirements for market risk. BIS document d457."),
         ])], icon="📚"),
     ])
 
@@ -590,6 +656,8 @@ def update_all(tab, alpha, lam, scenario, vals, ids):
             for a in ASSETS if a in latest.index)
         lvar  = (std_var_usd+lc_total) if not np.isnan(std_var_usd) else np.nan
         a_vol = ann_vol(port_ret) if not port_ret.empty else np.nan
+        last_r = port_ret.iloc[-1] if not port_ret.empty else np.nan
+        regime_label, regime_color = classify_regime(last_r)
         kpi = dbc.Row([
             dbc.Col(kpi_card("Portfolio AUM",               money(AUM),
                              f"{len(ASSETS)} assets")),
@@ -604,6 +672,8 @@ def update_all(tab, alpha, lam, scenario, vals, ids):
         side = [html.Div([html.B("AUM: "),      money(AUM)]),
                 html.Div([html.B("α: "),         f"{int(alpha*100)}%"]),
                 html.Div([html.B("λ: "),         f"{lam:.2f}"]),
+                html.Div([html.B("Regime: "),    regime_label],
+                         style={"color":regime_color,"fontWeight":600}),
                 html.Div([html.B("Scenario: "),  scenario])]
         if   tab == "tab-market": content = render_market(holdings, alpha)
         elif tab == "tab-var":    content = render_var(holdings, alpha)
