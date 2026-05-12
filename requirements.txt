@@ -2,7 +2,7 @@ yfinance
 pandas
 numpy
 plotly
-dash==2.0.0
+dash
 dash-bootstrap-components
 scipy
 gunicorn
